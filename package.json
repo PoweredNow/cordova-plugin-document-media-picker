@@ -1,0 +1,14 @@
+{
+    "name": "cordova-plugin-document-media-picker",
+    "version": "1.0.0",
+    "keywords": [
+        "ecosystem:cordova"
+    ],
+    "cordova": {
+        "id": "cordova-plugin-document-media-picker",
+        "platforms": [
+            "android",
+            "ios"
+        ]
+    }
+}

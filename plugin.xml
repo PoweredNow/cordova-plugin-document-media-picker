@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plugin xmlns="http://apache.org/cordova/ns/plugins/1.0"
+        id="cordova-plugin-document-media-picker"
+        version="1.0.0">
+    <name>cordova-plugin-document-media-picker</name>
+    <js-module src="www/filepicker.js" name="DocMediaPicker">
+        <clobbers target="DocMediaPicker" />
+    </js-module>
+
+    <platform name="android">
+        <config-file target="res/xml/config.xml" parent="/*">
+            <feature name="DocMediaPicker">
+                <param name="android-package" value="com.powerednow.filepicker.FilePicker" />
+            </feature>
+        </config-file>
+        <source-file src="src/android/FilePicker.java" target-dir="src/com/powerednow/filepicker" />
+    </platform>
+
+    <platform name="ios">
+        <config-file target="config.xml" parent="/*">
+            <feature name="DocMediaPicker">
+                <param name="ios-package" value="PNFilePicker" />
+            </feature>
+        </config-file>
+        <header-file src="src/ios/PNFilePicker.h" />
+        <source-file src="src/ios/PNFilePicker.m" />
+        <framework src="PhotosUI.framework" weak="true" />
+        <framework src="UniformTypeIdentifiers.framework" weak="true" />
+    </platform>
+</plugin>
