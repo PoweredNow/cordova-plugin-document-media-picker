@@ -30,11 +30,11 @@
                 PHPickerConfiguration *config = [[PHPickerConfiguration alloc] init];
                 NSString *mediaTypes = [[weakSelf.options objectForKey:@"mediaTypes"] isKindOfClass:[NSString class]] ? weakSelf.options[@"mediaTypes"] : @"all";
                 if ([mediaTypes.lowercaseString isEqualToString:@"images"]) {
-                    config.filter = [PHPickerFilter images];
+                    config.filter = [PHPickerFilter imagesFilter];
                 } else if ([mediaTypes.lowercaseString isEqualToString:@"videos"]) {
-                    config.filter = [PHPickerFilter videos];
+                    config.filter = [PHPickerFilter videosFilter];
                 } else {
-                    config.filter = [PHPickerFilter anyFilterMatchingSubfilters:@[[PHPickerFilter images], [PHPickerFilter videos]]];
+                    config.filter = [PHPickerFilter anyFilterMatchingSubfilters:@[[PHPickerFilter imagesFilter], [PHPickerFilter videosFilter]]];
                 }
                 config.selectionLimit = weakSelf.selectionLimit > 0 ? weakSelf.selectionLimit : (multiple ? 0 : 1);
 
@@ -46,7 +46,6 @@
                 while (vc.presentedViewController) { vc = vc.presentedViewController; }
                 [vc presentViewController:picker animated:YES completion:nil];
             } else {
-                // Fallback to document picker if PHPicker unavailable
                 [weakSelf presentDocumentPickerAllowMultiple:multiple];
             }
         } else {
@@ -87,7 +86,6 @@
                     }
                 }
             } else {
-                // Assume UTI identifier passed directly
                 [docTypes addObject:s];
             }
         }
@@ -104,7 +102,6 @@
     NSString *name = url.lastPathComponent ?: @"";
     if (name) info[@"name"] = name;
 
-    // File attributes: size and dates
     NSError *attrErr = nil;
     NSDictionary<NSFileAttributeKey, id> *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:url.path error:&attrErr];
     if (attrs) {
@@ -116,7 +113,6 @@
         if (modif) info[@"modifiedAt"] = @((long long)([modif timeIntervalSince1970] * 1000.0));
     }
 
-    // Mime type from extension
     NSString *ext = url.pathExtension.lowercaseString;
     if (@available(iOS 14.0, *)) {
         if (ext.length > 0) {
@@ -127,14 +123,12 @@
         }
     }
     if (!info[@"mime"]) {
-        // Fallback simple guesses
         if ([@[ @"jpg", @"jpeg" ] containsObject:ext]) info[@"mime"] = @"image/jpeg";
         else if ([ext isEqualToString:@"png"]) info[@"mime"] = @"image/png";
         else if ([ext isEqualToString:@"gif"]) info[@"mime"] = @"image/gif";
         else if ([ext isEqualToString:@"pdf"]) info[@"mime"] = @"application/pdf";
     }
 
-    // Image dimensions
     @try {
         UIImage *img = [UIImage imageWithContentsOfFile:url.path];
         if (img) {
@@ -152,6 +146,74 @@
     return info;
 }
 
+- (NSURL *)resizeImageIfNeeded:(NSURL *)imageURL
+{
+    NSNumber *maxDimensionOption = self.options[@"maxDimension"];
+    if (!maxDimensionOption || ![maxDimensionOption isKindOfClass:[NSNumber class]]) {
+        return imageURL; // No resizing needed
+    }
+    
+    CGFloat maxDimension = [maxDimensionOption floatValue];
+    if (maxDimension <= 0) {
+        return imageURL;
+    }
+    
+    UIImage *originalImage = [UIImage imageWithContentsOfFile:imageURL.path];
+    if (!originalImage) {
+        return imageURL;
+    }
+    
+    CGFloat originalWidth = originalImage.size.width;
+    CGFloat originalHeight = originalImage.size.height;
+    CGFloat longestSide = MAX(originalWidth, originalHeight);
+    
+    if (longestSide <= maxDimension) {
+        return imageURL;
+    }
+    
+    CGFloat scale = maxDimension / longestSide;
+    CGFloat newWidth = originalWidth * scale;
+    CGFloat newHeight = originalHeight * scale;
+    CGSize newSize = CGSizeMake(newWidth, newHeight);
+    
+    // Resize the image
+    UIGraphicsBeginImageContextWithOptions(newSize, NO, 1.0);
+    [originalImage drawInRect:CGRectMake(0, 0, newWidth, newHeight)];
+    UIImage *resizedImage = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
+    
+    if (!resizedImage) {
+        return imageURL;
+    }
+    
+    NSData *jpegData = UIImageJPEGRepresentation(resizedImage, 0.9); // 90% quality
+    if (!jpegData) {
+        return imageURL;
+    }
+    
+    NSString *originalPath = imageURL.path;
+    NSString *baseName = [[originalPath lastPathComponent] stringByDeletingPathExtension];
+    NSString *directory = [originalPath stringByDeletingLastPathComponent];
+    NSString *newFileName = [baseName stringByAppendingString:@"_resized.jpg"];
+    NSString *newPath = [directory stringByAppendingPathComponent:newFileName];
+    
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSInteger suffix = 1;
+    while ([fm fileExistsAtPath:newPath]) {
+        newFileName = [NSString stringWithFormat:@"%@_resized_%ld.jpg", baseName, (long)suffix];
+        newPath = [directory stringByAppendingPathComponent:newFileName];
+        suffix++;
+    }
+    
+    NSURL *newURL = [NSURL fileURLWithPath:newPath];
+    if ([jpegData writeToURL:newURL atomically:YES]) {
+        [fm removeItemAtURL:imageURL error:nil];
+        return newURL;
+    }
+    
+    return imageURL;
+}
+
 - (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls
 {
     NSMutableArray *result = [NSMutableArray arrayWithCapacity:urls.count];
@@ -165,7 +227,6 @@
             NSString *destPath = [cacheDir stringByAppendingPathComponent:fileName];
             NSURL *destURL = [NSURL fileURLWithPath:destPath];
 
-            // Ensure unique filename
             NSInteger suffix = 1;
             NSString *baseName = [fileName stringByDeletingPathExtension];
             NSString *ext = [fileName pathExtension];
@@ -200,7 +261,6 @@
         }
     }
 
-    // Enforce selection limit for document results if needed
     if (self.selectionLimit > 0 && result.count > self.selectionLimit) {
         NSRange range = NSMakeRange(self.selectionLimit, result.count - self.selectionLimit);
         [result removeObjectsInRange:range];
@@ -218,7 +278,6 @@
     self.callbackId = nil;
 }
 
-// PHPicker delegate
 - (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results API_AVAILABLE(ios(14.0))
 {
     [picker dismissViewControllerAnimated:YES completion:nil];
@@ -247,45 +306,80 @@
         }
         if (!typeToLoad) continue;
 
+        UTType *ut = nil;
+        NSString *derivedExt = nil;
+        NSString *derivedMime = nil;
+        if (@available(iOS 14.0, *)) {
+            ut = [UTType typeWithIdentifier:typeToLoad];
+            derivedExt = ut.preferredFilenameExtension ?: @"";
+            derivedMime = ut.preferredMIMEType ?: nil;
+        }
+
         dispatch_group_enter(group);
         [provider loadFileRepresentationForTypeIdentifier:typeToLoad completionHandler:^(NSURL * _Nullable url, NSError * _Nullable error) {
-            @try {
-                if (url && !error) {
-                    NSString *suggested = provider.suggestedName ?: url.lastPathComponent ?: [[NSUUID UUID] UUIDString];
-                    NSString *destPath = [cacheDir stringByAppendingPathComponent:suggested];
-                    NSURL *destURL = [NSURL fileURLWithPath:destPath];
+                    @try {
+                        if (url && !error) {
+                            // Build a suggested filename:
+                            // 1) prefer provider.suggestedName if it already has an extension
+                            // 2) otherwise use the original temp URL's lastPathComponent (often has the correct extension)
+                            // 3) finally, append UTType-derived extension if still missing
+                            NSString *suggested = provider.suggestedName ?: @"";
+                            NSString *urlName = url.lastPathComponent ?: @"";
+                            NSString *extFromSuggested = suggested.pathExtension;
+                            NSString *extFromURL = urlName.pathExtension;
 
-                    // unique name
-                    NSInteger suffix = 1;
-                    NSString *base = [suggested stringByDeletingPathExtension];
-                    NSString *ext = [suggested pathExtension];
-                    while ([fm fileExistsAtPath:destPath]) {
-                        NSString *candidate = ext.length > 0 ? [NSString stringWithFormat:@"%@ (%ld).%@", base, (long)suffix, ext] : [NSString stringWithFormat:@"%@ (%ld)", base, (long)suffix];
-                        destPath = [cacheDir stringByAppendingPathComponent:candidate];
-                        destURL = [NSURL fileURLWithPath:destPath];
-                        suffix++;
-                    }
+                            if (suggested.length == 0) {
+                                suggested = urlName.length ? urlName : [NSUUID UUID].UUIDString;
+                            }
+                            if (extFromSuggested.length == 0 && extFromURL.length > 0) {
+                                suggested = urlName;
+                                extFromSuggested = extFromURL;
+                            }
+                            if (suggested.pathExtension.length == 0 && derivedExt.length > 0) {
+                                suggested = [suggested stringByAppendingPathExtension:derivedExt];
+                            }
 
-                    NSError *copyErr = nil;
-                    if (![fm copyItemAtURL:url toURL:destURL error:&copyErr]) {
-                        // Attempt data copy
-                        NSData *data = [NSData dataWithContentsOfURL:url];
-                        if (data) {
-                            [data writeToURL:destURL atomically:YES];
-                            copyErr = nil;
+                            NSString *destPath = [cacheDir stringByAppendingPathComponent:suggested];
+                            NSURL *destURL = [NSURL fileURLWithPath:destPath];
+
+                            NSInteger suffix = 1;
+                            NSString *base = [suggested stringByDeletingPathExtension];
+                            NSString *ext = [suggested pathExtension];
+                            while ([fm fileExistsAtPath:destPath]) {
+                                NSString *candidate = ext.length > 0 ? [NSString stringWithFormat:@"%@ (%ld).%@", base, (long)suffix, ext] : [NSString stringWithFormat:@"%@ (%ld)", base, (long)suffix];
+                                destPath = [cacheDir stringByAppendingPathComponent:candidate];
+                                destURL = [NSURL fileURLWithPath:destPath];
+                                suffix++;
+                            }
+
+                            NSError *copyErr = nil;
+                            if (![fm copyItemAtURL:url toURL:destURL error:&copyErr]) {
+                                NSData *data = [NSData dataWithContentsOfURL:url];
+                                if (data) {
+                                    [data writeToURL:destURL atomically:YES];
+                                    copyErr = nil;
+                                }
+                            }
+                            if (!copyErr && [fm fileExistsAtPath:destPath]) {
+                                NSURL *finalURL = destURL;
+                                if ([typeToLoad isEqualToString:@"public.image"]) {
+                                    finalURL = [self resizeImageIfNeeded:destURL];
+                                }
+                                
+                                NSMutableDictionary *info = [[self buildFileInfoForURL:finalURL] mutableCopy];
+                                if (derivedMime.length > 0 && !info[@"mime"]) {
+                                    info[@"mime"] = derivedMime;
+                                }
+                                @synchronized (collected) { if (info) [collected addObject:info]; }
+                            }
                         }
+                    } @catch (NSException *exception) {
+                        // ignore individual item failure
+                    } @finally {
+                        dispatch_group_leave(group);
                     }
-                    if (!copyErr && [fm fileExistsAtPath:destPath]) {
-                        NSDictionary *info = [self buildFileInfoForURL:destURL];
-                        @synchronized (collected) { if (info) [collected addObject:info]; }
-                    }
-                }
-            } @catch (NSException *exception) {
-                // ignore individual item failure
-            } @finally {
-                dispatch_group_leave(group);
-            }
-        }];
+                }];
+
     }
 
     dispatch_group_notify(group, dispatch_get_main_queue(), ^{
