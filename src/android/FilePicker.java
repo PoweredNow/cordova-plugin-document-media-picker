@@ -15,6 +15,7 @@ import android.text.TextUtils;
 import android.webkit.MimeTypeMap;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.media.ExifInterface;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.RequiresExtension;
@@ -159,10 +160,6 @@ public class FilePicker extends CordovaPlugin {
     }
 
     private Uri resizeImageIfNeeded(ContentResolver resolver, Uri imageUri) {
-        if (maxDimension <= 0) {
-            return imageUri;
-        }
-
         String mimeType = null;
         try {
             mimeType = resolver.getType(imageUri);
@@ -184,35 +181,52 @@ public class FilePicker extends CordovaPlugin {
             int originalHeight = options.outHeight;
             int longestSide = Math.max(originalWidth, originalHeight);
 
-            if (longestSide <= maxDimension) {
-                return imageUri;
+            Bitmap processedBitmap;
+
+            if (maxDimension > 0 && longestSide > maxDimension) {
+                float scale = (float) maxDimension / longestSide;
+                int newWidth = Math.round(originalWidth * scale);
+                int newHeight = Math.round(originalHeight * scale);
+
+                inputStream = resolver.openInputStream(imageUri);
+                Bitmap originalBitmap = BitmapFactory.decodeStream(inputStream);
+                if (inputStream != null) inputStream.close();
+
+                if (originalBitmap == null) {
+                    return imageUri;
+                }
+
+                processedBitmap = Bitmap.createScaledBitmap(originalBitmap, newWidth, newHeight, true);
+                originalBitmap.recycle();
+            } else {
+                inputStream = resolver.openInputStream(imageUri);
+                processedBitmap = BitmapFactory.decodeStream(inputStream);
+                if (inputStream != null) inputStream.close();
+
+                if (processedBitmap == null) {
+                    return imageUri;
+                }
             }
-
-            float scale = (float) maxDimension / longestSide;
-            int newWidth = Math.round(originalWidth * scale);
-            int newHeight = Math.round(originalHeight * scale);
-
-            inputStream = resolver.openInputStream(imageUri);
-            Bitmap originalBitmap = BitmapFactory.decodeStream(inputStream);
-            if (inputStream != null) inputStream.close();
-
-            if (originalBitmap == null) {
-                return imageUri;
-            }
-
-            Bitmap resizedBitmap = Bitmap.createScaledBitmap(originalBitmap, newWidth, newHeight, true);
-            originalBitmap.recycle();
 
             File cacheDir = cordova.getContext().getCacheDir();
             String fileName = "resized_" + System.currentTimeMillis() + ".jpg";
             File resizedFile = new File(cacheDir, fileName);
 
             FileOutputStream outputStream = new FileOutputStream(resizedFile);
-            boolean saved = resizedBitmap.compress(Bitmap.CompressFormat.JPEG, 90, outputStream);
+            boolean saved = processedBitmap.compress(Bitmap.CompressFormat.JPEG, 90, outputStream);
             outputStream.close();
-            resizedBitmap.recycle();
+            processedBitmap.recycle();
 
             if (saved && resizedFile.exists()) {
+                try {
+                    ExifInterface originalExif = new ExifInterface(resolver.openInputStream(imageUri));
+                    ExifInterface newExif = new ExifInterface(resizedFile.getAbsolutePath());
+
+                    copyExifData(originalExif, newExif);
+
+                    newExif.saveAttributes();
+                } catch (Exception exifException) {}
+
                 return Uri.fromFile(resizedFile);
             }
         } catch (Exception e) {
@@ -220,6 +234,48 @@ public class FilePicker extends CordovaPlugin {
         }
 
         return imageUri;
+    }
+
+    private void copyExifData(ExifInterface source, ExifInterface destination) {
+        String[] exifTags = {
+                ExifInterface.TAG_DATETIME,
+                ExifInterface.TAG_DATETIME_DIGITIZED,
+                ExifInterface.TAG_DATETIME_ORIGINAL,
+                ExifInterface.TAG_MAKE,
+                ExifInterface.TAG_MODEL,
+                ExifInterface.TAG_ORIENTATION,
+                ExifInterface.TAG_WHITE_BALANCE,
+                ExifInterface.TAG_FOCAL_LENGTH,
+                ExifInterface.TAG_FLASH,
+                ExifInterface.TAG_IMAGE_LENGTH,
+                ExifInterface.TAG_IMAGE_WIDTH,
+                ExifInterface.TAG_GPS_LATITUDE,
+                ExifInterface.TAG_GPS_LATITUDE_REF,
+                ExifInterface.TAG_GPS_LONGITUDE,
+                ExifInterface.TAG_GPS_LONGITUDE_REF,
+                ExifInterface.TAG_GPS_ALTITUDE,
+                ExifInterface.TAG_GPS_ALTITUDE_REF,
+                ExifInterface.TAG_GPS_TIMESTAMP,
+                ExifInterface.TAG_GPS_DATESTAMP,
+                ExifInterface.TAG_EXPOSURE_TIME,
+                ExifInterface.TAG_APERTURE_VALUE,
+                ExifInterface.TAG_ISO_SPEED_RATINGS,
+                ExifInterface.TAG_SUBSEC_TIME,
+                ExifInterface.TAG_SUBSEC_TIME_ORIGINAL,
+                ExifInterface.TAG_SUBSEC_TIME_DIGITIZED,
+                ExifInterface.TAG_IMAGE_DESCRIPTION,
+                ExifInterface.TAG_SOFTWARE,
+                ExifInterface.TAG_ARTIST,
+                ExifInterface.TAG_COPYRIGHT,
+                ExifInterface.TAG_GPS_PROCESSING_METHOD
+        };
+
+        for (String tag : exifTags) {
+            String value = source.getAttribute(tag);
+            if (value != null) {
+                destination.setAttribute(tag, value);
+            }
+        }
     }
 
     private void configureIntentMimeTypes(Intent intent, String[] types) {
