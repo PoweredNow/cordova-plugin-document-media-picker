@@ -36,11 +36,14 @@ Options
 - mimeTypes: string[] (document picker filters; on iOS, accepts UTType identifiers or MIME types on iOS 14+)
 - mediaTypes: 'images' | 'videos' | 'all' (default 'all')
 - selectionLimit: number (0 = unlimited where supported; default 0)
+- maxDimension: number (0 = no resizing; default 0)
+- convertImageToJpeg: boolean (default true; when false, images are only converted to JPEG if they exceed maxDimension and need resizing)
 
 Notes
 - iOS uses PHPicker for media on iOS 14+ and falls back to UIDocumentPicker otherwise.
 - Android uses ACTION_OPEN_DOCUMENT for documents and either ACTION_PICK_IMAGES (API 33+, images only) or ACTION_OPEN_DOCUMENT with media filters for media.
 - URIs returned by Android's ACTION_PICK_IMAGES are not persisted across restarts; copy the content if you need long-term access.
+- Image selections are converted to JPEG by default. Non-image files such as PDFs are returned unchanged.
 
 API Reference
 window.DocMediaPicker.showPicker(options) => Promise<Item[]> where Item has the fields described above.

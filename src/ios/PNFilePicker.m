@@ -1,5 +1,7 @@
 #import "PNFilePicker.h"
 
+static NSString * const PNFilePickerJpegConversionErrorDomain = @"PNFilePickerJpegConversionError";
+
 @interface PNFilePicker ()
 @end
 
@@ -94,6 +96,163 @@
     return @[ @"public.data" ];
 }
 
+- (NSError *)jpegConversionErrorWithMessage:(NSString *)message underlyingError:(NSError *)underlyingError
+{
+    NSMutableDictionary *userInfo = [NSMutableDictionary dictionary];
+    userInfo[NSLocalizedDescriptionKey] = message ?: @"JPEG_CONVERSION_FAILED";
+    if (underlyingError) {
+        userInfo[NSUnderlyingErrorKey] = underlyingError;
+    }
+    return [NSError errorWithDomain:PNFilePickerJpegConversionErrorDomain code:1 userInfo:userInfo];
+}
+
+- (void)sendJpegConversionError:(NSError *)error
+{
+    NSString *message = error.localizedDescription ?: @"JPEG_CONVERSION_FAILED";
+    CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:message];
+    [self.commandDelegate sendPluginResult:pluginResult callbackId:self.callbackId];
+    self.callbackId = nil;
+}
+
+- (BOOL)urlLooksLikeImage:(NSURL *)url
+{
+    NSString *ext = url.pathExtension.lowercaseString;
+
+    if (@available(iOS 14.0, *)) {
+        NSDictionary<NSURLResourceKey, id> *values = [url resourceValuesForKeys:@[NSURLContentTypeKey] error:nil];
+        UTType *contentType = values[NSURLContentTypeKey];
+        if ([contentType isKindOfClass:[UTType class]] && [contentType conformsToType:UTTypeImage]) {
+            return YES;
+        }
+
+        if (ext.length > 0) {
+            UTType *type = [UTType typeWithFilenameExtension:ext];
+            if (type && [type conformsToType:UTTypeImage]) {
+                return YES;
+            }
+        }
+    }
+
+    if (ext.length == 0) return NO;
+
+    static NSSet<NSString *> *imageExtensions;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        imageExtensions = [NSSet setWithArray:@[
+            @"jpg", @"jpeg", @"png", @"gif", @"heic", @"heif", @"webp", @"bmp", @"tif", @"tiff"
+        ]];
+    });
+    return [imageExtensions containsObject:ext];
+}
+
+- (BOOL)shouldConvertImageToJpeg
+{
+    id option = self.options[@"convertImageToJpeg"];
+    return [option respondsToSelector:@selector(boolValue)] ? [option boolValue] : YES;
+}
+
+- (NSURL *)uniqueJpegURLForImageURL:(NSURL *)imageURL resized:(BOOL)resized
+{
+    NSString *originalPath = imageURL.path;
+    NSString *baseName = [[originalPath lastPathComponent] stringByDeletingPathExtension];
+    if (baseName.length == 0) {
+        baseName = [NSUUID UUID].UUIDString;
+    }
+    NSString *directory = [originalPath stringByDeletingLastPathComponent];
+    NSString *suffix = resized ? @"resized" : @"converted";
+    NSString *newFileName = [NSString stringWithFormat:@"%@_%@.jpg", baseName, suffix];
+    NSString *newPath = [directory stringByAppendingPathComponent:newFileName];
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSInteger index = 1;
+    while ([fm fileExistsAtPath:newPath]) {
+        newFileName = [NSString stringWithFormat:@"%@_%@_%ld.jpg", baseName, suffix, (long)index];
+        newPath = [directory stringByAppendingPathComponent:newFileName];
+        index++;
+    }
+
+    return [NSURL fileURLWithPath:newPath];
+}
+
+- (NSURL *)convertImageToJpegIfNeeded:(NSURL *)imageURL knownImage:(BOOL)knownImage error:(NSError **)error
+{
+    BOOL shouldProcess = knownImage || [self urlLooksLikeImage:imageURL];
+    if (!shouldProcess) {
+        return imageURL;
+    }
+
+    BOOL convertOption = [self shouldConvertImageToJpeg];
+    CGFloat maxDimension = 0;
+    NSNumber *maxDimensionOption = self.options[@"maxDimension"];
+    if ([maxDimensionOption isKindOfClass:[NSNumber class]]) {
+        maxDimension = MAX(0, maxDimensionOption.floatValue);
+    }
+
+    if (!convertOption && maxDimension <= 0) {
+        return imageURL;
+    }
+
+    UIImage *originalImage = [UIImage imageWithContentsOfFile:imageURL.path];
+    if (!originalImage) {
+        if (convertOption && error) {
+            *error = [self jpegConversionErrorWithMessage:@"JPEG_CONVERSION_FAILED: Unable to decode selected image" underlyingError:nil];
+        }
+        return convertOption ? nil : imageURL;
+    }
+
+    UIImage *outputImage = originalImage;
+    CGFloat originalWidth = originalImage.size.width;
+    CGFloat originalHeight = originalImage.size.height;
+    CGFloat longestSide = MAX(originalWidth, originalHeight);
+    BOOL resized = maxDimension > 0 && longestSide > maxDimension;
+    BOOL shouldConvert = convertOption || resized;
+
+    if (!shouldConvert) {
+        return imageURL;
+    }
+
+    if (resized) {
+        CGFloat scale = maxDimension / longestSide;
+        CGFloat newWidth = MAX(1.0, originalWidth * scale);
+        CGFloat newHeight = MAX(1.0, originalHeight * scale);
+        CGSize newSize = CGSizeMake(newWidth, newHeight);
+
+        UIGraphicsBeginImageContextWithOptions(newSize, YES, 1.0);
+        [[UIColor whiteColor] setFill];
+        UIRectFill(CGRectMake(0, 0, newWidth, newHeight));
+        [originalImage drawInRect:CGRectMake(0, 0, newWidth, newHeight)];
+        outputImage = UIGraphicsGetImageFromCurrentImageContext();
+        UIGraphicsEndImageContext();
+
+        if (!outputImage) {
+            if (error) {
+                *error = [self jpegConversionErrorWithMessage:@"JPEG_CONVERSION_FAILED: Unable to resize selected image" underlyingError:nil];
+            }
+            return nil;
+        }
+    }
+
+    NSData *jpegData = UIImageJPEGRepresentation(outputImage, 0.9);
+    if (!jpegData) {
+        if (error) {
+            *error = [self jpegConversionErrorWithMessage:@"JPEG_CONVERSION_FAILED: Unable to encode selected image as JPEG" underlyingError:nil];
+        }
+        return nil;
+    }
+
+    NSURL *jpegURL = [self uniqueJpegURLForImageURL:imageURL resized:resized];
+    NSError *writeError = nil;
+    if (![jpegData writeToURL:jpegURL options:NSDataWritingAtomic error:&writeError]) {
+        if (error) {
+            *error = [self jpegConversionErrorWithMessage:@"JPEG_CONVERSION_FAILED: Unable to write JPEG image" underlyingError:writeError];
+        }
+        return nil;
+    }
+
+    [[NSFileManager defaultManager] removeItemAtURL:imageURL error:nil];
+    return jpegURL;
+}
+
 - (NSDictionary *)buildFileInfoForURL:(NSURL *)url
 {
     NSMutableDictionary *info = [NSMutableDictionary dictionary];
@@ -146,79 +305,12 @@
     return info;
 }
 
-- (NSURL *)resizeImageIfNeeded:(NSURL *)imageURL
-{
-    NSNumber *maxDimensionOption = self.options[@"maxDimension"];
-    if (!maxDimensionOption || ![maxDimensionOption isKindOfClass:[NSNumber class]]) {
-        return imageURL; // No resizing needed
-    }
-    
-    CGFloat maxDimension = [maxDimensionOption floatValue];
-    if (maxDimension <= 0) {
-        return imageURL;
-    }
-    
-    UIImage *originalImage = [UIImage imageWithContentsOfFile:imageURL.path];
-    if (!originalImage) {
-        return imageURL;
-    }
-    
-    CGFloat originalWidth = originalImage.size.width;
-    CGFloat originalHeight = originalImage.size.height;
-    CGFloat longestSide = MAX(originalWidth, originalHeight);
-    
-    if (longestSide <= maxDimension) {
-        return imageURL;
-    }
-    
-    CGFloat scale = maxDimension / longestSide;
-    CGFloat newWidth = originalWidth * scale;
-    CGFloat newHeight = originalHeight * scale;
-    CGSize newSize = CGSizeMake(newWidth, newHeight);
-    
-    // Resize the image
-    UIGraphicsBeginImageContextWithOptions(newSize, NO, 1.0);
-    [originalImage drawInRect:CGRectMake(0, 0, newWidth, newHeight)];
-    UIImage *resizedImage = UIGraphicsGetImageFromCurrentImageContext();
-    UIGraphicsEndImageContext();
-    
-    if (!resizedImage) {
-        return imageURL;
-    }
-    
-    NSData *jpegData = UIImageJPEGRepresentation(resizedImage, 0.9); // 90% quality
-    if (!jpegData) {
-        return imageURL;
-    }
-    
-    NSString *originalPath = imageURL.path;
-    NSString *baseName = [[originalPath lastPathComponent] stringByDeletingPathExtension];
-    NSString *directory = [originalPath stringByDeletingLastPathComponent];
-    NSString *newFileName = [baseName stringByAppendingString:@"_resized.jpg"];
-    NSString *newPath = [directory stringByAppendingPathComponent:newFileName];
-    
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSInteger suffix = 1;
-    while ([fm fileExistsAtPath:newPath]) {
-        newFileName = [NSString stringWithFormat:@"%@_resized_%ld.jpg", baseName, (long)suffix];
-        newPath = [directory stringByAppendingPathComponent:newFileName];
-        suffix++;
-    }
-    
-    NSURL *newURL = [NSURL fileURLWithPath:newPath];
-    if ([jpegData writeToURL:newURL atomically:YES]) {
-        [fm removeItemAtURL:imageURL error:nil];
-        return newURL;
-    }
-    
-    return imageURL;
-}
-
 - (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls
 {
     NSMutableArray *result = [NSMutableArray arrayWithCapacity:urls.count];
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *cacheDir = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject];
+    NSError *conversionFailure = nil;
 
     for (NSURL *url in urls) {
         BOOL accessStarted = [url startAccessingSecurityScopedResource];
@@ -249,7 +341,13 @@
             }
 
             if (!err && [fm fileExistsAtPath:destPath]) {
-                NSDictionary *info = [self buildFileInfoForURL:destURL];
+                NSError *conversionError = nil;
+                NSURL *finalURL = [self convertImageToJpegIfNeeded:destURL knownImage:NO error:&conversionError];
+                if (conversionError) {
+                    conversionFailure = conversionError;
+                }
+
+                NSDictionary *info = conversionFailure ? nil : [self buildFileInfoForURL:finalURL];
                 if (info) [result addObject:info];
             }
         } @catch (NSException *exception) {
@@ -258,6 +356,11 @@
             if (accessStarted) {
                 [url stopAccessingSecurityScopedResource];
             }
+        }
+
+        if (conversionFailure) {
+            [self sendJpegConversionError:conversionFailure];
+            return;
         }
     }
 
@@ -293,6 +396,7 @@
     dispatch_group_t group = dispatch_group_create();
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *cacheDir = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject];
+    __block NSError *conversionFailure = nil;
 
     for (PHPickerResult *res in results) {
         NSItemProvider *provider = res.itemProvider;
@@ -362,15 +466,25 @@
                             }
                             if (!copyErr && [fm fileExistsAtPath:destPath]) {
                                 NSURL *finalURL = destURL;
+                                NSError *conversionError = nil;
                                 if ([typeToLoad isEqualToString:@"public.image"]) {
-                                    finalURL = [self resizeImageIfNeeded:destURL];
+                                    finalURL = [self convertImageToJpegIfNeeded:destURL knownImage:YES error:&conversionError];
+                                    if (conversionError) {
+                                        @synchronized (collected) {
+                                            if (!conversionFailure) {
+                                                conversionFailure = conversionError;
+                                            }
+                                        }
+                                    }
                                 }
-                                
-                                NSMutableDictionary *info = [[self buildFileInfoForURL:finalURL] mutableCopy];
-                                if (derivedMime.length > 0 && !info[@"mime"]) {
-                                    info[@"mime"] = derivedMime;
+
+                                if (finalURL && !conversionError) {
+                                    NSMutableDictionary *info = [[self buildFileInfoForURL:finalURL] mutableCopy];
+                                    if (derivedMime.length > 0 && !info[@"mime"]) {
+                                        info[@"mime"] = derivedMime;
+                                    }
+                                    @synchronized (collected) { if (info) [collected addObject:info]; }
                                 }
-                                @synchronized (collected) { if (info) [collected addObject:info]; }
                             }
                         }
                     } @catch (NSException *exception) {
@@ -383,6 +497,15 @@
     }
 
     dispatch_group_notify(group, dispatch_get_main_queue(), ^{
+        NSError *fatalError = nil;
+        @synchronized (collected) {
+            fatalError = conversionFailure;
+        }
+        if (fatalError) {
+            [self sendJpegConversionError:fatalError];
+            return;
+        }
+
         CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsArray:collected];
         [self.commandDelegate sendPluginResult:pluginResult callbackId:self.callbackId];
         self.callbackId = nil;

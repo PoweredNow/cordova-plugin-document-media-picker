@@ -42,6 +42,17 @@ public class FilePicker extends CordovaPlugin {
     private String[] mimeTypes = null;
     private int selectionLimit = 0; // 0 = unlimited
     private int maxDimension = 0; // 0 = no resizing
+    private boolean convertImageToJpeg = true;
+
+    private static class JpegConversionException extends Exception {
+        JpegConversionException(String message) {
+            super(message);
+        }
+
+        JpegConversionException(String message, Throwable cause) {
+            super(message, cause);
+        }
+    }
 
     @Override
     public boolean execute(String action, JSONArray args, CallbackContext callbackContext) {
@@ -59,6 +70,7 @@ public class FilePicker extends CordovaPlugin {
     }
 
     private void parseOptions(JSONArray args) {
+        this.convertImageToJpeg = true;
         try {
             if (args != null && args.length() > 0) {
                 JSONObject opts = args.optJSONObject(0);
@@ -71,6 +83,7 @@ public class FilePicker extends CordovaPlugin {
                         this.selectionLimit = Math.max(0, opts.optInt("selectionLimit", 0));
                     if (opts.has("maxDimension"))
                         this.maxDimension = Math.max(0, opts.optInt("maxDimension", 0));
+                    this.convertImageToJpeg = opts.optBoolean("convertImageToJpeg", true);
                     JSONArray mt = opts.optJSONArray("mimeTypes");
                     if (mt != null && mt.length() > 0) {
                         this.mimeTypes = new String[mt.length()];
@@ -159,81 +172,192 @@ public class FilePicker extends CordovaPlugin {
         return intent;
     }
 
-    private Uri resizeImageIfNeeded(ContentResolver resolver, Uri imageUri) {
+    private Uri convertImageToJpegIfNeeded(ContentResolver resolver, Uri imageUri) throws JpegConversionException {
         String mimeType = null;
         try {
             mimeType = resolver.getType(imageUri);
         } catch (Exception ignored) {
         }
 
-        if (mimeType == null || !mimeType.startsWith("image/")) {
+        boolean mimeSaysImage = mimeType != null && mimeType.startsWith("image/");
+        boolean mimeSaysGeneric = mimeType == null
+                || "*/*".equals(mimeType)
+                || "application/octet-stream".equalsIgnoreCase(mimeType);
+        if (mimeType != null && !mimeSaysImage && !mimeSaysGeneric) {
             return imageUri;
         }
+
+        if (!convertImageToJpeg && maxDimension <= 0) {
+            return imageUri;
+        }
+
+        boolean isImage = mimeSaysImage;
+        boolean conversionRequired = false;
+        Bitmap originalBitmap = null;
+        Bitmap processedBitmap = null;
+        File convertedFile = null;
 
         try {
             BitmapFactory.Options options = new BitmapFactory.Options();
             options.inJustDecodeBounds = true;
-            InputStream inputStream = resolver.openInputStream(imageUri);
-            BitmapFactory.decodeStream(inputStream, null, options);
-            if (inputStream != null) inputStream.close();
+            try (InputStream inputStream = resolver.openInputStream(imageUri)) {
+                if (inputStream == null) {
+                    if (isImage && convertImageToJpeg) {
+                        throw new JpegConversionException("JPEG_CONVERSION_FAILED: Unable to open selected image");
+                    }
+                    return imageUri;
+                }
+                BitmapFactory.decodeStream(inputStream, null, options);
+            }
 
             int originalWidth = options.outWidth;
             int originalHeight = options.outHeight;
+            if (originalWidth <= 0 || originalHeight <= 0) {
+                if (isImage && convertImageToJpeg) {
+                    throw new JpegConversionException("JPEG_CONVERSION_FAILED: Unable to read selected image dimensions");
+                }
+                return imageUri;
+            }
+            isImage = true;
             int longestSide = Math.max(originalWidth, originalHeight);
+            boolean resized = maxDimension > 0 && longestSide > maxDimension;
+            boolean shouldConvert = convertImageToJpeg || resized;
 
-            Bitmap processedBitmap;
+            if (!shouldConvert) {
+                return imageUri;
+            }
+            conversionRequired = true;
 
-            if (maxDimension > 0 && longestSide > maxDimension) {
+            try (InputStream inputStream = resolver.openInputStream(imageUri)) {
+                if (inputStream == null) {
+                    throw new JpegConversionException("JPEG_CONVERSION_FAILED: Unable to open selected image");
+                }
+                originalBitmap = BitmapFactory.decodeStream(inputStream);
+            }
+
+            if (originalBitmap == null) {
+                throw new JpegConversionException("JPEG_CONVERSION_FAILED: Unable to decode selected image");
+            }
+
+            if (resized) {
                 float scale = (float) maxDimension / longestSide;
-                int newWidth = Math.round(originalWidth * scale);
-                int newHeight = Math.round(originalHeight * scale);
-
-                inputStream = resolver.openInputStream(imageUri);
-                Bitmap originalBitmap = BitmapFactory.decodeStream(inputStream);
-                if (inputStream != null) inputStream.close();
-
-                if (originalBitmap == null) {
-                    return imageUri;
-                }
-
+                int newWidth = Math.max(1, Math.round(originalWidth * scale));
+                int newHeight = Math.max(1, Math.round(originalHeight * scale));
                 processedBitmap = Bitmap.createScaledBitmap(originalBitmap, newWidth, newHeight, true);
-                originalBitmap.recycle();
             } else {
-                inputStream = resolver.openInputStream(imageUri);
-                processedBitmap = BitmapFactory.decodeStream(inputStream);
-                if (inputStream != null) inputStream.close();
+                processedBitmap = originalBitmap;
+            }
 
-                if (processedBitmap == null) {
-                    return imageUri;
-                }
+            if (processedBitmap == null) {
+                throw new JpegConversionException("JPEG_CONVERSION_FAILED: Unable to prepare selected image");
             }
 
             File cacheDir = cordova.getContext().getCacheDir();
-            String fileName = "resized_" + System.currentTimeMillis() + ".jpg";
-            File resizedFile = new File(cacheDir, fileName);
+            convertedFile = uniqueCacheFile(cacheDir, convertedImageFileName(resolver, imageUri, resized));
 
-            FileOutputStream outputStream = new FileOutputStream(resizedFile);
-            boolean saved = processedBitmap.compress(Bitmap.CompressFormat.JPEG, 90, outputStream);
-            outputStream.close();
-            processedBitmap.recycle();
-
-            if (saved && resizedFile.exists()) {
-                try {
-                    ExifInterface originalExif = new ExifInterface(resolver.openInputStream(imageUri));
-                    ExifInterface newExif = new ExifInterface(resizedFile.getAbsolutePath());
-
-                    copyExifData(originalExif, newExif);
-
-                    newExif.saveAttributes();
-                } catch (Exception exifException) {}
-
-                return Uri.fromFile(resizedFile);
+            boolean saved;
+            try (FileOutputStream outputStream = new FileOutputStream(convertedFile)) {
+                saved = processedBitmap.compress(Bitmap.CompressFormat.JPEG, 90, outputStream);
+                outputStream.flush();
             }
+
+            if (!saved || !convertedFile.exists() || convertedFile.length() == 0) {
+                if (convertedFile.exists()) convertedFile.delete();
+                throw new JpegConversionException("JPEG_CONVERSION_FAILED: Unable to write JPEG image");
+            }
+
+            try (InputStream exifInputStream = resolver.openInputStream(imageUri)) {
+                if (exifInputStream != null) {
+                    ExifInterface originalExif = new ExifInterface(exifInputStream);
+                    ExifInterface newExif = new ExifInterface(convertedFile.getAbsolutePath());
+                    copyExifData(originalExif, newExif);
+                    newExif.saveAttributes();
+                }
+            } catch (Exception exifException) {
+            }
+
+            return Uri.fromFile(convertedFile);
+        } catch (JpegConversionException e) {
+            throw e;
         } catch (Exception e) {
-            // If anything fails, return the original URI
+            if (isImage && (convertImageToJpeg || conversionRequired)) {
+                if (convertedFile != null && convertedFile.exists()) convertedFile.delete();
+                throw new JpegConversionException("JPEG_CONVERSION_FAILED: Unable to convert selected image to JPEG", e);
+            }
+            return imageUri;
+        } finally {
+            if (processedBitmap != null && processedBitmap != originalBitmap) {
+                processedBitmap.recycle();
+            }
+            if (originalBitmap != null) {
+                originalBitmap.recycle();
+            }
+        }
+    }
+
+    private String convertedImageFileName(ContentResolver resolver, Uri imageUri, boolean resized) {
+        String originalName = displayNameForUri(resolver, imageUri);
+        if (TextUtils.isEmpty(originalName)) {
+            originalName = imageUri.getLastPathSegment();
         }
 
-        return imageUri;
+        if (!TextUtils.isEmpty(originalName)) {
+            int slash = Math.max(originalName.lastIndexOf('/'), originalName.lastIndexOf('\\'));
+            if (slash >= 0 && slash < originalName.length() - 1) {
+                originalName = originalName.substring(slash + 1);
+            }
+        }
+
+        String baseName = originalName;
+        if (!TextUtils.isEmpty(baseName)) {
+            int dot = baseName.lastIndexOf('.');
+            if (dot > 0) {
+                baseName = baseName.substring(0, dot);
+            }
+        }
+
+        if (TextUtils.isEmpty(baseName)) {
+            baseName = "image_" + System.currentTimeMillis();
+        }
+
+        baseName = baseName.replaceAll("[\\\\/:*?\"<>|\\p{Cntrl}]", "_").trim();
+        if (TextUtils.isEmpty(baseName)) {
+            baseName = "image_" + System.currentTimeMillis();
+        }
+
+        return baseName + (resized ? "_resized.jpg" : "_converted.jpg");
+    }
+
+    private String displayNameForUri(ContentResolver resolver, Uri uri) {
+        try (Cursor cursor = resolver.query(uri, new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+            if (cursor != null && cursor.moveToFirst()) {
+                int nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                if (nameIdx != -1) {
+                    return cursor.getString(nameIdx);
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return null;
+    }
+
+    private File uniqueCacheFile(File cacheDir, String fileName) {
+        File file = new File(cacheDir, fileName);
+        String baseName = fileName;
+        String extension = "";
+        int dot = fileName.lastIndexOf('.');
+        if (dot > 0) {
+            baseName = fileName.substring(0, dot);
+            extension = fileName.substring(dot);
+        }
+
+        int suffix = 1;
+        while (file.exists()) {
+            file = new File(cacheDir, baseName + "_" + suffix + extension);
+            suffix++;
+        }
+
+        return file;
     }
 
     private void copyExifData(ExifInterface source, ExifInterface destination) {
@@ -326,6 +450,9 @@ public class FilePicker extends CordovaPlugin {
                 }
                 try {
                     results.put(buildFileInfo(resolver, single));
+                } catch (JpegConversionException e) {
+                    sendError(e.getMessage());
+                    return;
                 } catch (JSONException ignored) {
                 }
             }
@@ -342,6 +469,9 @@ public class FilePicker extends CordovaPlugin {
                         }
                         try {
                             results.put(buildFileInfo(resolver, uri));
+                        } catch (JpegConversionException e) {
+                            sendError(e.getMessage());
+                            return;
                         } catch (JSONException ignored) {
                         }
                     }
@@ -363,8 +493,15 @@ public class FilePicker extends CordovaPlugin {
         }
     }
 
-    private JSONObject buildFileInfo(ContentResolver resolver, Uri uri) throws JSONException {
-        Uri finalUri = resizeImageIfNeeded(resolver, uri);
+    private void sendError(String message) {
+        if (callbackContext != null) {
+            callbackContext.error(message);
+            callbackContext = null;
+        }
+    }
+
+    private JSONObject buildFileInfo(ContentResolver resolver, Uri uri) throws JSONException, JpegConversionException {
+        Uri finalUri = convertImageToJpegIfNeeded(resolver, uri);
 
         JSONObject obj = new JSONObject();
         obj.put("uri", finalUri.toString());
