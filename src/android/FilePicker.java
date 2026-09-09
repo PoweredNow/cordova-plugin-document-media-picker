@@ -34,6 +34,7 @@ public class FilePicker extends CordovaPlugin {
 
     private static final int REQUEST_CODE_DOC = 9812;
     private static final int REQUEST_CODE_MEDIA = 9813;
+    private static final int REQUEST_CODE_VIDEO_CAPTURE = 9814;
     private CallbackContext callbackContext;
 
     private boolean allowMultiple = true;
@@ -43,6 +44,7 @@ public class FilePicker extends CordovaPlugin {
     private int selectionLimit = 0; // 0 = unlimited
     private int maxDimension = 0; // 0 = no resizing
     private boolean convertImageToJpeg = true;
+    private int duration = 0; // 0 = no duration limit
 
     private static class JpegConversionException extends Exception {
         JpegConversionException(String message) {
@@ -56,6 +58,13 @@ public class FilePicker extends CordovaPlugin {
 
     @Override
     public boolean execute(String action, JSONArray args, CallbackContext callbackContext) {
+        if ("captureVideo".equals(action)) {
+            this.callbackContext = callbackContext;
+            parseOptions(args);
+            openVideoCapture();
+            return true;
+        }
+
         if ("showPicker".equals(action)) {
             this.callbackContext = callbackContext;
             parseOptions(args);
@@ -71,6 +80,7 @@ public class FilePicker extends CordovaPlugin {
 
     private void parseOptions(JSONArray args) {
         this.convertImageToJpeg = true;
+        this.duration = 0;
         try {
             if (args != null && args.length() > 0) {
                 JSONObject opts = args.optJSONObject(0);
@@ -83,6 +93,8 @@ public class FilePicker extends CordovaPlugin {
                         this.selectionLimit = Math.max(0, opts.optInt("selectionLimit", 0));
                     if (opts.has("maxDimension"))
                         this.maxDimension = Math.max(0, opts.optInt("maxDimension", 0));
+                    if (opts.has("duration"))
+                        this.duration = Math.max(0, opts.optInt("duration", 0));
                     this.convertImageToJpeg = opts.optBoolean("convertImageToJpeg", true);
                     JSONArray mt = opts.optJSONArray("mimeTypes");
                     if (mt != null && mt.length() > 0) {
@@ -112,6 +124,30 @@ public class FilePicker extends CordovaPlugin {
             intent.putExtra(DocumentsContract.EXTRA_INITIAL_URI, (Uri) null);
 
             cordova.startActivityForResult(FilePicker.this, intent, REQUEST_CODE_DOC);
+        };
+
+        if (activity != null) activity.runOnUiThread(r);
+        else r.run();
+    }
+
+    private void openVideoCapture() {
+        final Activity activity = this.cordova.getActivity();
+        Runnable r = () -> {
+            Intent intent = new Intent(MediaStore.ACTION_VIDEO_CAPTURE);
+            if (duration > 0) {
+                intent.putExtra(MediaStore.EXTRA_DURATION_LIMIT, duration);
+            }
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            intent.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+
+            try {
+                cordova.startActivityForResult(FilePicker.this, intent, REQUEST_CODE_VIDEO_CAPTURE);
+            } catch (Exception e) {
+                if (callbackContext != null) {
+                    callbackContext.error("Video capture is not available on this device.");
+                    callbackContext = null;
+                }
+            }
         };
 
         if (activity != null) activity.runOnUiThread(r);
@@ -417,7 +453,7 @@ public class FilePicker extends CordovaPlugin {
 
     @Override
     public void onActivityResult(int requestCode, int resultCode, Intent data) {
-        if (requestCode != REQUEST_CODE_DOC && requestCode != REQUEST_CODE_MEDIA) return;
+        if (requestCode != REQUEST_CODE_DOC && requestCode != REQUEST_CODE_MEDIA && requestCode != REQUEST_CODE_VIDEO_CAPTURE) return;
 
         if (resultCode == Activity.RESULT_CANCELED) {
             if (callbackContext != null) {

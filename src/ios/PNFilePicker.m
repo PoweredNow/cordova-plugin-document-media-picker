@@ -56,6 +56,50 @@ static NSString * const PNFilePickerJpegConversionErrorDomain = @"PNFilePickerJp
     });
 }
 
+- (void)captureVideo:(CDVInvokedUrlCommand*)command
+{
+    self.callbackId = command.callbackId;
+    id firstArg = command.arguments.count > 0 ? command.arguments[0] : nil;
+    if ([firstArg isKindOfClass:[NSDictionary class]]) {
+        self.options = (NSDictionary *)firstArg;
+    } else {
+        self.options = @{};
+    }
+
+    if (![UIImagePickerController isSourceTypeAvailable:UIImagePickerControllerSourceTypeCamera]) {
+        CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:@"Video capture is not available on this device."];
+        [self.commandDelegate sendPluginResult:pluginResult callbackId:self.callbackId];
+        self.callbackId = nil;
+        return;
+    }
+
+    NSArray<NSString *> *availableMediaTypes = [UIImagePickerController availableMediaTypesForSourceType:UIImagePickerControllerSourceTypeCamera];
+    if (![availableMediaTypes containsObject:@"public.movie"]) {
+        CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:@"Video capture is not available on this device."];
+        [self.commandDelegate sendPluginResult:pluginResult callbackId:self.callbackId];
+        self.callbackId = nil;
+        return;
+    }
+
+    __weak __typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIImagePickerController *picker = [[UIImagePickerController alloc] init];
+        picker.sourceType = UIImagePickerControllerSourceTypeCamera;
+        picker.mediaTypes = @[ @"public.movie" ];
+        picker.delegate = weakSelf;
+        picker.videoQuality = UIImagePickerControllerQualityTypeHigh;
+
+        NSNumber *duration = weakSelf.options[@"duration"];
+        if ([duration respondsToSelector:@selector(doubleValue)] && duration.doubleValue > 0) {
+            picker.videoMaximumDuration = duration.doubleValue;
+        }
+
+        UIViewController *vc = weakSelf.viewController;
+        while (vc.presentedViewController) { vc = vc.presentedViewController; }
+        [vc presentViewController:picker animated:YES completion:nil];
+    });
+}
+
 - (void)presentDocumentPickerAllowMultiple:(BOOL)multiple
 {
     NSArray<NSString *> *types = [self documentTypesFromOptions:self.options];
@@ -172,6 +216,29 @@ static NSString * const PNFilePickerJpegConversionErrorDomain = @"PNFilePickerJp
     }
 
     return [NSURL fileURLWithPath:newPath];
+}
+
+- (NSURL *)uniqueCacheURLForFileName:(NSString *)fileName
+{
+    NSString *cacheDir = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *safeFileName = fileName.length > 0 ? fileName : [[NSUUID UUID] UUIDString];
+    if (safeFileName.pathExtension.length == 0) {
+        safeFileName = [safeFileName stringByAppendingPathExtension:@"MOV"];
+    }
+
+    NSString *destPath = [cacheDir stringByAppendingPathComponent:safeFileName];
+    NSInteger suffix = 1;
+    NSString *baseName = [safeFileName stringByDeletingPathExtension];
+    NSString *ext = [safeFileName pathExtension];
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    while ([fm fileExistsAtPath:destPath]) {
+        NSString *candidate = ext.length > 0 ? [NSString stringWithFormat:@"%@ (%ld).%@", baseName, (long)suffix, ext] : [NSString stringWithFormat:@"%@ (%ld)", baseName, (long)suffix];
+        destPath = [cacheDir stringByAppendingPathComponent:candidate];
+        suffix++;
+    }
+
+    return [NSURL fileURLWithPath:destPath];
 }
 
 - (NSURL *)convertImageToJpegIfNeeded:(NSURL *)imageURL knownImage:(BOOL)knownImage error:(NSError **)error
@@ -376,6 +443,47 @@ static NSString * const PNFilePickerJpegConversionErrorDomain = @"PNFilePickerJp
 
 - (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)controller
 {
+    CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsArray:@[]];
+    [self.commandDelegate sendPluginResult:pluginResult callbackId:self.callbackId];
+    self.callbackId = nil;
+}
+
+- (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey, id> *)info
+{
+    [picker dismissViewControllerAnimated:YES completion:nil];
+
+    NSURL *mediaURL = info[UIImagePickerControllerMediaURL];
+    if (!mediaURL) {
+        CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:@"No video was captured."];
+        [self.commandDelegate sendPluginResult:pluginResult callbackId:self.callbackId];
+        self.callbackId = nil;
+        return;
+    }
+
+    NSString *fileName = mediaURL.lastPathComponent ?: [[NSUUID UUID] UUIDString];
+    NSURL *destURL = [self uniqueCacheURLForFileName:fileName];
+    NSError *copyError = nil;
+    if (![[NSFileManager defaultManager] copyItemAtURL:mediaURL toURL:destURL error:&copyError]) {
+        CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:@"Unable to prepare captured video."];
+        [self.commandDelegate sendPluginResult:pluginResult callbackId:self.callbackId];
+        self.callbackId = nil;
+        return;
+    }
+
+    NSMutableDictionary *fileInfo = [[self buildFileInfoForURL:destURL] mutableCopy];
+    if (!fileInfo[@"mime"]) {
+        fileInfo[@"mime"] = @"video/quicktime";
+    }
+
+    CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsArray:@[fileInfo]];
+    [self.commandDelegate sendPluginResult:pluginResult callbackId:self.callbackId];
+    self.callbackId = nil;
+}
+
+- (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker
+{
+    [picker dismissViewControllerAnimated:YES completion:nil];
+
     CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsArray:@[]];
     [self.commandDelegate sendPluginResult:pluginResult callbackId:self.callbackId];
     self.callbackId = nil;
