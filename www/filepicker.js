@@ -2,6 +2,21 @@ var exec = require('cordova/exec');
 
 var DocMediaPicker = {
   /**
+   * Capture a video with the native camera app.
+   * @param {Object} [options]
+   * @param {number} [options.duration=0] - Maximum duration in seconds where supported (0 = no limit)
+   * @returns {Promise<Array<{uri:string,name?:string,size?:number,mime?:string,width?:number,height?:number,createdAt?:number,modifiedAt?:number}>>}
+   */
+  captureVideo: function (options) {
+    var opts = options || {};
+    if (typeof opts.duration !== 'number') opts.duration = 0;
+
+    return new Promise(function (resolve, reject) {
+      exec(resolve, reject, 'DocMediaPicker', 'captureVideo', [opts]);
+    });
+  },
+
+  /**
    * Show a picker dialog.
    * @param {Object} [options]
    * @param {('document'|'media')} [options.mode='document'] - Which picker to show
